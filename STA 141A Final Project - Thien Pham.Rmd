@@ -1,0 +1,544 @@
+---
+title: "STA 131A Final Project"
+author: "Thien Pham"
+date: "2025-02-10"
+output: html_document
+---
+
+
+
+```{r include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(viridis)
+library(infotheo) 
+library(gridExtra)
+library(glmnet)
+```
+
+With the advent of much finer neural recording software, the goals of neuroscience were broadened with the addition of much more accurate. This pursuit was realized in the *Distributed coding of choice, action and engagement across the mouse brain* study by Nicholas A. Steinmetz. A study which procured the data set in which we will analyze in this report. Here we explore the goal of understanding the relationship between neural spike patterns, neural distributions across brain regions, and their procured performance and feedback on trials. To do so, we begin with exploratory data analysis to highlight possible caveats and points of interest within the raw data. That being differences and variances across trials, sessions, and mice, but also relationships and novel findings. From our analysis, we found that rather than a sole brain region being responsible for a majority of the neural spikes, it is actually a combined effort of the entire brain coming together to formulate a neural response. Additionally, neural patterns across all mice were similar which may infer that the brain and brain region's performance my be uniformly patterned even across mice and sessions. Through this analysis and a subsequent integration of data, we constructed a log based prediction model that was able to classify and predict performance and feedback type solely on nueral data.
+
+# **INTRODUCTION**
+
+```{r}
+# Provided code to load the RDS files
+
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('session',i,'.rds',sep=''))
+}
+```
+
+Our raw data consists of 18 RDS files, each corresponding to a subset of 18 of the total 39 sessions. Each session records both the neurological and behavioral response from the mice following the variable stimuli. In addition to session data such as trial count, neuron count, and the names of the mice, each session has each of the following variables available for analysis:
+
+- feedback_type: that is the type of feedback the mouse receives following a trial. This variable takes on 2 values, (1) for a successful trial and (-1) for a failed trial.
+- contrast_right: Contrast for the Right Stimulus ranging in intensity from (0) to (1) in steps of (0.25).
+- contrast_lefti: Contrast for the Left Stimulus ranging in intensity similarly to Right Contrast Stimuli.
+- spks: Count of Spikes in Neuron activity within the visual cortex. These will fall into Time Bins:
+- time: The center of the time bins in which Spikes fall.
+- brain_area: The area of the brain in which the neuron resides.
+
+
+# **EXPLORATORY DATA ANALYSIS**
+
+Before proceeding with any modeling we will first start with an exploratory data analysis. With the sheer complexity and size of our data, certain assumptions might need to be made and the caveats that arise from doing so should be addressed. In particular, the homogeneity and heterogeneity across sessions may influence the viability of pulling data across sessions. To perform our EDA, we will provide:
+
+- A summary of each session and trial. That is, a quick and dirty count of trials, neurons, and the recording of any other miscellaneous data and relevant trial information.
+- A Visualization of data across sessions and assess trends, patterns, relationships, and points of interest accordingly.
+- An educated guess on what might need to be done to properly prep our data for further analysis and model construction. (Normalization/Standardization/etc.)
+
+In addition to providing a better understanding of our raw data, these conclusions will provide valuable insights further down the line as we continue on to data integration and the construction of our model itself.
+
+i) Summary of Data
+
+We will start with examining the structure of our data over all sessions and mice if applicable. That is, neuron count, trial count and accuracy. We will make ample use of bar plots here to display the data in an aggregate and simple manner.
+
+```{r}
+# Counting Trials. Implement if/else to counter missing NA entries. Num Neurons will count spikes while 
+# Num trials will count the length of feedback types (Naturally a feedback being administered implies a trial took place.)
+
+# If the entry is NOT NULL and its length is greater than 0, return the spike. If we reach outside the if brackets, 
+# return NA
+
+nrn_count <- sapply(session, function(s) {
+  if (!is.null(s$spks) && length(s$spks) > 0) {
+    initial_trial_nrn <- s$spks[[1]] 
+    if (is.matrix(initial_trial_nrn)) {
+      return(nrow(initial_trial_nrn))
+    }
+  }
+  return(NA)
+})
+
+# If the entry is NOT NULL, return the formatted feedback type. Else, return NA
+
+trial_count <- sapply(session, function(s) {
+  if (!is.null(s$feedback_type)) {
+    return(length(s$feedback_type))
+  } else {
+    return(NA)
+  }
+})
+
+# It won't knit properly without this line I'm not really sure why.
+
+session_id <- 1:length(session)
+
+# New data frame for each session containing its ID, trial length, and neuron count.
+
+sessions_info <- data.frame(session_id, nrn_count, trial_count)
+
+# Plot the amount of neurons for each session
+
+median_nrn_count <- median(sessions_info$nrn_count, na.arm = TRUE)
+median_trial_count <- median(sessions_info$trial_count, na.arm = TRUE)
+
+p1i <- ggplot(sessions_info, aes(x = factor(session_id), y = nrn_count)) +
+  geom_bar(stat = "identity") +
+  geom_hline(aes(yintercept = median_nrn_count), color = "blue", size = 1.5) +
+  labs(title = "Neuron Count by Session", x = "Session ID", y = " Neuron Count")
+
+# Plot the amount of trials for each session
+
+p2i <- ggplot(sessions_info, aes(x = factor(session_id), y = trial_count)) +
+  geom_bar(stat = "identity") +
+  geom_hline(aes(yintercept = median_trial_count), color = "blue", size = 1.5) +
+  labs(title = "Trial Count by Session", x = "Session ID", y = " Trial Count")
+
+grid.arrange(p1i, p2i, ncol = 2)
+```
+
+Starting off with the basics, we count the number of neuron spikes and trials per session. Immediately we can observe there are some notable outliers and large variances in our data.
+
+Neuron Count:
+- Unusually high Neuron Count in Session 4 and an especially low count in Session 16.
+- Median of 822.5
+
+Trial Count:
+- Unusually low Trial Count in Session 1 and notably higher trial counts in session 10 and session 15
+- Median of 261
+
+From a glance, it is looking like we may need to normalize/standardize our data before constructing our model. Pulling data from across sessions runs the risk of randomly pulling from an outlier which may lead to inaccurate predictions and classifications.
+
+
+```{r}
+# Similarly to previous graphs, use if else to avoid null entries.
+
+# Format as string just to be sure.
+
+mouse_name <- sapply(session, function(s) {
+  if (!is.null(s$mouse)) {
+    return(s$mouse)  # Modify based on actual field name
+  } else {
+    return(NA)
+  }
+})
+
+# Use mean() to return the proportion of correct guesses
+
+acc <- sapply(session, function(s) {
+  if (!is.null(s$feedback_type)) {
+    return(mean(s$feedback_type, na.rm = TRUE)) 
+  } else {
+    return(NA)
+  }
+})
+
+# New data frame that stores accuracy by session and mouse for plotting
+
+acc_info <- data.frame(
+  session_id = 1:length(session),
+  name = mouse_name,
+  acc = acc * 100
+)
+
+# Remove missing data
+
+acc_info <- na.omit(acc_info)
+
+# Plot Accuracy By Mouse, grouping by the name of each mouse.
+
+ggplot(acc_info, aes(x = session_id, y = acc, fill = as.factor(name), group = name)) +
+  geom_bar(stat = "identity", position = "dodge") +
+    scale_x_continuous(breaks = seq(1, 18, 1)) +
+  labs(title = "Accuracy of each Mouse Across Sessions",
+       x = "Session ID",
+       y = "Accuracy by Percent",
+       fill = "Mouse Name")
+
+```
+
+Taking a look now at accuracy, the pattern of high variability continues with a high range of accuracy across sessions and mice. Lederberg appears to be extremely skilled, consistently scoring considerably higher accuracy compared to the other three mice. On the other hand, Cori seems to be lagging behind with generally the lowest accuracy across sessions. Even within each mouse, some sessions measure considerably high accuracy compared to the mouse’s other sessions (Hench, trial 11). 
+
+At this point we are still incentivised to normalize/standardize our data due to the high variance in neuron count, trial count, and now the accuracy of each session and mouse.
+
+```{r, fig.width=10, fig.height=6}
+# Similar process, but with brain regions. We iterate over each brain region and each session and sum all spikes
+
+brain_regions <- do.call(rbind, lapply(1:length(session), function(s) {
+  regions <- unique(session[[s]]$brain_area)
+  
+  
+  
+  spike_count <- sapply(regions, function(area) {
+    trials <- session[[s]]$spks
+    sum(sapply(trials, function(spk_mat) {
+      if (!is.null(spk_mat)) {
+        spike_rgn <- which(session[[s]]$brain_area == area)
+        return(sum(spk_mat[spike_rgn, ], na.rm = TRUE)) 
+      }
+      return(0)
+    }))
+  })
+  data.frame(brain_area = regions, spike_count = spike_count, session = s)
+}))
+
+# Initialize and group data frame for plotting
+
+region_summary <- brain_regions %>%
+  group_by(brain_area) %>%
+  summarize(spike_count = sum(spike_count, na.rm = TRUE)) %>%
+  arrange(desc(spike_count))
+
+# Plot Spike Count by Brain Region
+
+ggplot(region_summary, aes(x = reorder(brain_area, -spike_count), y = spike_count, fill = brain_area)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # Leave the coords to the left to make room for the legend.
+  labs(title = "Neuron Activity by Brain Region",
+       x = "Brain Region",
+       y = "Neural Spike Count")
+```
+
+Finally, we have brain regions. Particularly, which regions are the most popular among neuron spikes. From the plot, we can see that root is a very active source with the second closest region MB still being considerably far behind in recorded neuron spikes. Although it is easy to assume that the root is the sole source of a large portion of the spikes, it might also be that it is simply a hot spot that facilitates most other brain regions (Hence the fact that it is called the "root"). I am much more inclined to believe that the response to the stimuli is a brain wide coordinated effort, rather than one region taking hold. Regardless, the root's dominance is still relevant.
+
+Points of Interest - Roots, Lederberg the Mouse (High Scoring Mouse), Cori (Low Scoring Mouse), Session 4 (High Neuron Count), Session 16 (Low Neuron Count), Session 10 (High Trial Count), Session 1 (Low Trial Count).
+
+Takeaways: High variance in trial and neuron count. Distribution of average neuron fire rates is skewed to the right. Session Independence is rampant within mouse accuracy and most likely neurological data. I would not be comfortable training a model off of the raw data. As such normalization, standardization, and scaling are most likely required for sound model construction.
+
+**ii) Homogeneity and Heterogeneity**
+
+With a quick overview of our data complete, we move on now to prying open the variance, consistency, and caveats of our data. Here we also hope to extract novel ideas about our data which may help inform us on the model construction process.I am particularly interested in the topology of the brain regions and how they may play into neuron fire rates and feedback types. Here we hope to explore:
+
+- **Baseline**: Does average fire rate differ by session?
+- **Hive Mind**: Are the mice thinking the same? That is are neural patterns consistent across each mouse?
+- **Locale**: Are the same Brain Regions being employed consistently across sessions?
+
+```{r}
+# We will construct a thorough fire rate data frame for plotting. To simplify things, this frame will be very in depth allowing us to draw multiple plots from the same data frame.
+
+# Initialize fire rate, and initialize components (trias/brain region/mouse name)
+
+fire_rates <- do.call(rbind, lapply(1:length(session), function(s) {
+  trials <- session[[s]]$spks
+  brain_areas <- session[[s]]$brain_area
+  mouse <- session[[s]]$mouse_id
+
+  # Compute average fire rates, store region, neuron counts, 
+
+  firing_rates <- do.call(rbind, lapply(1:length(trials), function(t) {
+    
+    # No Nulls please
+    
+    if (!is.null(trials[[t]])) {
+      nrn_counts <- nrow(trials[[t]])
+      spike_amount <- rowSums(trials[[t]], na.rm = TRUE)  # total spikes
+      trial_duration <- ncol(trials[[t]]) * 0.01  # We're converting to seconds here for the avg fire rate calc
+      
+      data.frame(
+        session = s,
+        brain_area = brain_areas[1:nrn_counts],  
+        firing_rate = spike_amount / trial_duration 
+      )
+    }
+  }))
+  return(firing_rates)
+}))
+
+# Being very sure to remove NA/Nulls
+
+fire_rates <- na.omit(fire_rates)
+```
+
+Baseline:
+
+```{r}
+ggplot(fire_rates, aes(x = as.factor(session), y = firing_rate, fill = as.factor(session))) +
+  geom_boxplot(outlier.shape = NA) +
+  theme_minimal() +
+  labs(title = "Variability of Fire Rates by Session",
+       x = "Session ID",
+       y = "Fire Rate") +
+  coord_cartesian(ylim = c(0, 20))
+```
+Observing the box plots across sessions, it is clear there is some amount of variance in Fire Rate. However, it isn't as high as I have expected, with most sessions actually looking extremely similar to one another. All others fall similarly together somewhat above the lower baseline. Regardless, it is likely some sort of standardization/normalization will be necessary before moving towards model construction.
+
+HIVE MIND
+
+```{r}
+ggplot(fire_rates, aes(x = firing_rate, color = as.factor(session))) +
+  geom_density(alpha = 0.3) +
+  labs(title = "Fire Rate Distribution across Sessions",
+       x = "Fire Rates",
+       y = "Density") +
+  coord_cartesian(xlim = c(0, 20))
+```
+
+Across all sessions, the patterns are near identical with session peaks and valleys occurring around roughly the same fire rate values. Where the sessions come to differ are the intensity of each peak and valley. As such we can infer that each mouse *does* think the same over the course of each session. It is simply a matter of intensity and execution, rather than a difference in neural patterns entirely. Regardless, that intensity still varies greatly (Observe the first initial peak on the left and the large amounts of differing y intercepts) so the similarity in neural patterns isn't enough to convince us not to mutate our data.
+
+```{r}
+# Fire rate by Brain Region (Original, but further cut down in next chunk to only consider top 5 brain regions)
+
+session_data_list <- list()
+
+# Loop through all sessions
+for (i in 1:length(session)) {
+  
+  # Ensure there are no NA and NULLS.
+  
+  if (!is.null(session[[i]])) {
+    session_data <- data.frame(
+      session_id = i,
+      trial_id = seq_along(session[[i]]$spks), 
+      brain_area = rep(session[[i]]$brain_area, each = length(session[[i]]$spks)), # Iterate through every single trial
+      firing_rate = sapply(session[[i]]$spks, function(spikes) mean(spikes, na.rm = TRUE))  # Average Fier Rate
+    )
+    
+    # Store this session's data in the list
+    session_data_list[[i]] <- session_data
+  }
+}
+
+# New Heat map dataframe, containing all
+
+agg_data <- bind_rows(session_data_list)
+```
+
+
+```{r}
+# Obtain fire rate by brain regions
+
+htmap_data <- agg_data %>%
+  group_by(session_id, brain_area) %>%
+  summarize(avg_firing_rate = mean(firing_rate, na.rm = TRUE)) %>%
+  ungroup()
+
+# Pivot wide to initialize for heatmap
+
+htmp_mtx <- htmap_data %>%
+  pivot_wider(names_from = brain_area, values_from = avg_firing_rate)
+
+# Set sessions as a factor
+
+htmp_mtx$session_id <- as.factor(htmp_mtx$session_id)
+
+# Top five most active brain regions (From our earlier graph)
+
+# I was originally going to map all regions but the graph was too cluttered, I am adding this modifier of only the top five brain regions for clarity.
+
+top_5 <- c("root", "MB", "LGd", "CA1", "MRN")
+
+subset_regions <- agg_data %>%
+  filter(brain_area %in% top_5)
+
+# Display Heat Map
+
+ggplot(subset_regions, aes(x = brain_area, y = session_id, fill = firing_rate)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  scale_y_continuous(breaks = seq(1, 18, 1)) +
+  labs(title = "Neural Data by Top Five Brain Regions", 
+       x = "Brain Region", y = "Session ID", fill = "Average Fire Rate")
+
+```
+Empty cells/slots generally represent entries in which the Fire Rate is not high enough to be considered. With that in mind, root is (as expected) to be the most active region across all session with CA1 following somewhat closely behind. The other brain regions fall off sharply in comparison. We can infer that if necessary, we can possibly use predominant brain regions as predictors rather than the entirety of the brain.
+
+Although a singular brain region is being utilized consistently, the extent to which is still quite diverse. For example, root is utilized heavily in session 13, and then much less in session 14. This heavily implies session dependent brain region usage. Our hunches for normalization are further realized.
+
+Conclusion
+
+# **DATA INTEGRATION**
+
+Utilize our combined data set from the previous part to compare pre and post normalzition data
+
+Data is highly various, but the patterns is the same (see graph). I woudl assume that it is possibel to normalize the data while maintaining most of our integrity. 
+
+
+Normalize our data, and visualize what it did. Consider possible further attamptes to standardize it. However to prevent over mutation of the data we may leave it at this.
+
+```{r}
+
+# No normalization
+
+no_normal_fr <- agg_data %>% select(firing_rate, session_id, brain_area)
+
+# Normalized Data, we will be using standard z-score to normalize.
+
+agg_data <- agg_data %>%
+  group_by(session_id, brain_area) %>%
+  mutate(firing_rate_z = (firing_rate - mean(firing_rate)) / sd(firing_rate)) %>%
+  ungroup()
+
+# Extract the now mutated fire rates
+
+normal_fr <- agg_data %>% 
+  select(firing_rate_z, session_id, brain_area)
+
+# Plot both of them side by side to compare.
+
+p1j <- ggplot(no_normal_fr, aes(x = firing_rate, fill = brain_area)) +
+  geom_density(alpha = 0.25) +
+   theme(legend.position = "none") +
+  ggtitle("Non-Normal Fire Rate")
+
+p2j <- ggplot(normal_fr, aes(x = firing_rate_z, fill = brain_area)) +
+  geom_density(alpha = 0.25) +
+   theme(legend.position = "none") +
+  ggtitle("Fire Rate Normalized")
+
+grid.arrange(p1j, p2j, ncol = 2)
+
+```
+As we can see, the distribution is much nicer once normalized. Our raw data possessed too much variance across sessions to reasonably construct a model. Borrowing data across sessions in that state would leave too much up to chance.
+
+I chose to also group by brain region to show that one brain region or a small group of them will be a good indicator of all neural patterns, which may lessen the need to consider all brain regions when predicting feedback types.
+
+Moving forward, I do not believe there is a need to further standardize our data. The variance and differences across sessions although noticeable, are not severe enough to warrant further mutation. Regardless, it may interfere with the prediction model if the data strays too far from the raw fire rates. The only thing we will need to do before constructing our model is re-scaling the data back up to the correct values as normalizing it shrunk our data points considerably.
+
+# **MODEL TRAINING AND EVALUATION**
+
+To start, I have my eyes on Logistic Regression (LASSO), as this model does best with binary operations. As we are discerning feedback types from success and failure (-1) and (1), I believe LASSO to be a strong starting point. 
+
+Using the glmnet package, I construct a LASSO model with an 80% training and 20% testing partition.
+
+```{r}
+# We begin by extracting our prediction and response variables. 
+
+max_neurons <- max(sapply(session, function(s) if (!is.null(s$spks)) max(sapply(s$spks, nrow)) else 0))
+
+# Initialize our lists to store relevant prediction and response data.
+
+X_pred <- list()
+Y_res <- list()
+
+for (i in 1:length(session)) {
+  df <- session[[i]]
+  
+  # I need to absolutley make sure there are no NULL values as even one will prevent this model from working.
+  
+  if (!is.null(df$spks) && length(df$spks) > 0) {
+    
+    # Compute avg fire rate for every single neuron
+    
+    firing_rates <- lapply(df$spks, function(trial) {
+      mean_rates <- rowMeans(trial)  # Average over ti me bins
+      
+      # We need to make sure eveery single trial is the same length
+      
+      length(mean_rates) <- max_neurons # Adding zeros to match up the length, this shouldnt ruin the integrity of the data
+      return(mean_rates)
+    })
+    
+    firing_rates <- do.call(rbind, firing_rates)  # Combine trials
+    
+    # Store features and labels
+    X_pred[[i]] <- firing_rates
+    Y_res[[i]] <- df$feedback_type
+  }
+}
+
+# Convert lists to matrices
+X <- do.call(rbind, X_pred)
+Y <- unlist(Y_res)
+
+# Replace NAs introduced by padding with 0s
+X[is.na(X)] <- 0
+
+
+```
+
+```{r}
+# Scaling
+
+X_scaled <- scale(X)
+```
+
+```{r}
+set.seed(123)  # For reproducibility
+
+# parition the data manually because i coudln't get caret to work. 80% training 20% test
+
+train_ratio <- 0.8
+train_indices <- sample(1:nrow(X), size = floor(train_ratio * nrow(X))) # Select 80% of data
+
+# Partition accordingly
+
+X_train <- X[train_indices, , drop = FALSE]
+Y_train <- Y[train_indices]
+
+X_test <- X[-train_indices, , drop = FALSE]
+Y_test <- Y[-train_indices]
+```
+
+```{r}
+# Convert y_train to a binary factor if needed
+Y_train <- as.factor(Y_train)
+
+# Train the LASSO logistic regression model
+lasso_model <- cv.glmnet(X_train, Y_train, family = "binomial", alpha = 1)  # Alpha = 1 for LASSO
+```
+
+```{r}
+final_predict <- predict(lasso_model, newx = X_test, s = "lambda.min", type = "response")
+
+# Classify and label with 0.5 threshold. Either its 1, or -1
+
+y_pred <- ifelse(final_predict > 0.5, 1, -1)
+```
+
+```{r}
+# Converting our test response as a factor
+
+Y_test <- as.factor(Y_test)
+
+# Calc accuracy, display as percent
+
+total_accuracy <- mean(y_pred == Y_test)
+print(paste(round(total_accuracy * 100, 2),"Accuracy in Percent %"))
+
+# Show results
+
+confusion_matrix <- table(Predicted = y_pred, Actual = Y_test)
+print(confusion_matrix)
+```
+We reach an accuracy of 71.68 Percent total accuracy. Notably:
+
+- Our model's largest mistake is guessing positive feedback, when in actuality negative at a total of 267, a near 85% of our mistakes. This should be a focal point going forward if changes are to be made.
+- On the other hand, our model did very well in guessing positive feedback, which makes sense considering we may be guessing positive feedback *too* much.
+
+# **POSSIBLE AUGMENTS**
+
+- We may want to be stricter when it comes to classifying positive feedback as we are guessing it too much to the point where we are incorrectly classifying negative feedback as positive.
+- From my data integration and EDA, I feel as if adding brain region won't be that significant of an addition to the model. That is because brain region (disregarding across sessions) is quite consistent. That is, there is no single brain region that we can solely rely on as they all act roughly the same. And also considering there are so many of them, the caveats simply would not be worth it. 
+
+As for why I did not consider the other two models introduced in this class:
+
+LDA - Highly generalized. LASSO's specialty in binary predictions would have most likely beaten LDA out in consistency and simplicity. It just wouldn't be worth the added complexity.
+kNN - Scales very well with higher amounts of classification but again, we are working with either positive, or negative feedback. Nothing else. Not to mention that this method would add a considerable amount of working parts and complexity.
+
+# **CLOSING THOUGHTS**
+
+Our initial raw data was significantly heterogeneous. So much so that the idea to standardize our data before constructing our model was mandated. Otherwise, we discovered that neural patterns and brain regions are actually quite similar across sessions. Perhaps if the trial and neuron count and the skills of each mouse where less various, the raw data may have been fit to model right off the bat. 
+
+A simple Z-Normalization was more than enough to properly format our data, confirming that the raw data may simply have been muddled by factors beyond neural patterns and brain region. As such, I guessed that since neural patterns and brain region 
+
+The LASSO model was an obvious choice for the first try, and exceeded my expectations still. It's inclination for modeling binary prediction gave it the edge over normally much more dimensional models such as LDA and kNN. That is because generally, the increases to complexity aren't worth it. Additionally I felt as if the added complexity introducing brain region and neural patterns was unnecessary as they were generally similar across sessions.
+
+Overall, what I can surmise from this report is that specific brain region plays a much smaller role than I expected, and that neural patterns are almost uniform across sessions and mice. It is not a sole brain region that is responsible for performance and subsequent feedback type, but rather the combined efforts of all of the regions.
+
+# Reference {-}
+
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
